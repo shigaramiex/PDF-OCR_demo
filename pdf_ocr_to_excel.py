@@ -8,22 +8,39 @@ PDF OCR -> Excel 転記スクリプト
     python pdf_ocr_to_excel.py invoice.pdf output.xlsx
 """
 
+import io
 import sys
 import re
+import threading
+import tkinter as tk
+from tkinter import filedialog, scrolledtext, ttk
 from pathlib import Path
 
+import numpy as np
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter
 
-# スキャンPDF向けOCR（任意）
+# --- OCRライブラリ可用性チェック ---
+try:
+    from paddleocr import PaddleOCR
+    _PADDLE_AVAILABLE = True
+except ImportError:
+    _PADDLE_AVAILABLE = False
+
 try:
     import pytesseract
-    from pdf2image import convert_from_path
-    OCR_AVAILABLE = True
+    _TESSERACT_AVAILABLE = True
 except ImportError:
-    OCR_AVAILABLE = False
+    _TESSERACT_AVAILABLE = False
+
+# pdf2image は PaddleOCR / Tesseract 両方で共用
+try:
+    from pdf2image import convert_from_path
+    _PDF2IMAGE_AVAILABLE = True
+except ImportError:
+    _PDF2IMAGE_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -41,17 +58,123 @@ def extract_with_pdfplumber(pdf_path: str) -> dict:
     return data
 
 
-def extract_with_ocr(pdf_path: str) -> dict:
-    """pdf2image + pytesseract でOCR抽出する（スキャンPDF向け）"""
-    if not OCR_AVAILABLE:
+def _pdf_to_images(pdf_path: str):
+    """PDFをPIL Imageのリストに変換する（DPI=300）"""
+    if not _PDF2IMAGE_AVAILABLE:
         raise RuntimeError(
-            "OCRライブラリが見つかりません。\n"
-            "  pip install pytesseract pdf2image pillow\n"
-            "また Tesseract-OCR 本体と日本語データ(jpn.traineddata)のインストールも必要です。"
+            "pdf2image が見つかりません: pip install pdf2image\n"
+            "また Poppler のインストールも必要です。"
+        )
+    return convert_from_path(pdf_path, dpi=300)
+
+
+def _group_into_lines(words: list, y_overlap_ratio: float = 0.4) -> list:
+    """
+    Y座標の重なりで word を行にグループ化し、X座標でソートして返す。
+    y_overlap_ratio: 行高さに対して重なりがこの割合以上なら同一行とみなす
+    """
+    if not words:
+        return []
+    words = sorted(words, key=lambda w: w["top"])
+    lines = [[words[0]]]
+
+    for w in words[1:]:
+        last = lines[-1]
+        # 最終行の平均 top/bottom
+        avg_top    = sum(x["top"]    for x in last) / len(last)
+        avg_bottom = sum(x["bottom"] for x in last) / len(last)
+        avg_height = max(avg_bottom - avg_top, 1)
+
+        overlap = min(w["bottom"], avg_bottom) - max(w["top"], avg_top)
+        if overlap >= avg_height * y_overlap_ratio:
+            last.append(w)
+        else:
+            lines.append([w])
+
+    return [sorted(line, key=lambda w: w["x0"]) for line in lines]
+
+
+def _lines_to_table(lines_grouped: list) -> list:
+    """
+    行グループからテーブル構造（list[list[str]]）を構築する。
+    列位置はX座標クラスタリングで推定する。
+    """
+    if not lines_grouped:
+        return []
+
+    # 全 word の x0 を収集 → 列境界をクラスタリング
+    all_x0 = sorted(set(round(w["x0"] / 15) * 15 for line in lines_grouped for w in line))
+
+    def col_index(x0):
+        for i, cx in enumerate(all_x0):
+            if abs(x0 - cx) <= 20:
+                return i
+        return len(all_x0) - 1
+
+    n_cols = len(all_x0)
+    table = []
+    for line in lines_grouped:
+        row = [""] * n_cols
+        for w in line:
+            ci = col_index(w["x0"])
+            row[ci] = (row[ci] + " " + w["text"]).strip()
+        # 末尾の空セルを取り除く
+        while row and row[-1] == "":
+            row.pop()
+        if any(row):
+            table.append(row)
+
+    return table
+
+
+def extract_with_paddleocr(pdf_path: str) -> dict:
+    """PaddleOCR でOCR抽出する（スキャンPDF向け・メイン OCR エンジン）"""
+    if not _PADDLE_AVAILABLE:
+        raise RuntimeError(
+            "PaddleOCR が見つかりません: pip install paddleocr paddlepaddle"
         )
     data = {"raw_text": "", "_tables": [], "_words": []}
-    images = convert_from_path(pdf_path, dpi=300)
-    for img in images:
+    ocr = PaddleOCR(use_angle_cls=True, lang="japan", show_log=False)
+
+    for img in _pdf_to_images(pdf_path):
+        img_np = np.array(img)
+        result = ocr.ocr(img_np, cls=True)
+        if not result or not result[0]:
+            continue
+
+        words = []
+        for line in result[0]:
+            bbox, (text, conf) = line
+            xs = [p[0] for p in bbox]
+            ys = [p[1] for p in bbox]
+            words.append({
+                "text": text, "conf": conf,
+                "x0": min(xs), "top": min(ys),
+                "x1": max(xs), "bottom": max(ys),
+            })
+
+        lines_grouped = _group_into_lines(words)
+        data["raw_text"] += "\n".join(
+            " ".join(w["text"] for w in line) for line in lines_grouped
+        ) + "\n"
+        data["_words"].extend(words)
+
+        table = _lines_to_table(lines_grouped)
+        if table:
+            data["_tables"].append(table)
+
+    return data
+
+
+def extract_with_tesseract(pdf_path: str) -> dict:
+    """pdf2image + pytesseract でOCR抽出する（フォールバック）"""
+    if not _TESSERACT_AVAILABLE:
+        raise RuntimeError(
+            "pytesseract が見つかりません: pip install pytesseract\n"
+            "また Tesseract-OCR 本体と jpn.traineddata のインストールも必要です。"
+        )
+    data = {"raw_text": "", "_tables": [], "_words": []}
+    for img in _pdf_to_images(pdf_path):
         data["raw_text"] += pytesseract.image_to_string(img, lang="jpn") + "\n"
     return data
 
@@ -441,43 +564,205 @@ def write_excel(invoice: dict, output_path: str):
 
 
 # ---------------------------------------------------------------------------
-# メイン
+# 変換処理（GUI / CLI 共通）
+# ---------------------------------------------------------------------------
+
+def run_conversion(pdf_path: str, output_path: str, log=print):
+    """PDF → Excel 変換の本体。log に呼び出し可能オブジェクトを渡すとそこへ出力する。"""
+    if not Path(pdf_path).exists():
+        raise FileNotFoundError(f"ファイルが見つかりません: {pdf_path}")
+
+    log(f"[1/3] PDF読み取り中: {pdf_path}")
+    data = extract_with_pdfplumber(pdf_path)
+
+    if len(data.get("raw_text", "").strip()) < 30:
+        if _PADDLE_AVAILABLE:
+            log("      → PaddleOCR で再抽出します...")
+            data = extract_with_paddleocr(pdf_path)
+        elif _TESSERACT_AVAILABLE:
+            log("      → PaddleOCR 未インストール。Tesseract にフォールバックします...")
+            data = extract_with_tesseract(pdf_path)
+        else:
+            log("[警告] OCRエンジンが見つかりません。テキスト抽出結果のみで続行します。")
+
+    log("[2/3] データ解析中...")
+    invoice = parse_invoice(data)
+
+    log(f"      日付      : {invoice['date'] or '（未検出）'}")
+    log(f"      会社名    : {invoice['company_name'] or '（未検出）'}")
+    log(f"      請求金額  : {invoice['total_amount'] or '（未検出）'}")
+    log(f"      明細件数  : {len(invoice['items'])} 件")
+    for it in invoice["items"]:
+        log(f"        - {it['name']}  数量:{it['qty']}  単価:{it['unit_price']}  金額:{it['amount']}")
+
+    log("[3/3] Excel書き出し中...")
+    write_excel(invoice, output_path)
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("PDF OCR → Excel 転記")
+        self.resizable(False, False)
+        self._build_ui()
+
+    # ---- UI構築 ----
+
+    def _build_ui(self):
+        PAD = dict(padx=10, pady=4)
+
+        # --- 入力PDF ---
+        frm_in = ttk.LabelFrame(self, text="入力 PDF ファイル")
+        frm_in.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 4))
+
+        self._pdf_var = tk.StringVar()
+        ttk.Entry(frm_in, textvariable=self._pdf_var, width=54).grid(
+            row=0, column=0, **PAD)
+        ttk.Button(frm_in, text="参照…", command=self._browse_pdf).grid(
+            row=0, column=1, padx=(0, 8))
+
+        # --- 出力Excel ---
+        frm_out = ttk.LabelFrame(self, text="出力 Excel ファイル")
+        frm_out.grid(row=1, column=0, sticky="ew", padx=12, pady=4)
+
+        self._xlsx_var = tk.StringVar()
+        ttk.Entry(frm_out, textvariable=self._xlsx_var, width=54).grid(
+            row=0, column=0, **PAD)
+        ttk.Button(frm_out, text="参照…", command=self._browse_xlsx).grid(
+            row=0, column=1, padx=(0, 8))
+
+        # --- 実行ボタン ---
+        self._run_btn = ttk.Button(self, text="変換実行", command=self._start,
+                                   style="Accent.TButton")
+        self._run_btn.grid(row=2, column=0, pady=8)
+
+        # --- ログエリア ---
+        frm_log = ttk.LabelFrame(self, text="ログ")
+        frm_log.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 4))
+
+        self._log_box = scrolledtext.ScrolledText(
+            frm_log, width=72, height=14, state="disabled",
+            font=("Consolas", 9), wrap="word")
+        self._log_box.pack(padx=6, pady=6)
+
+        # --- ステータスバー ---
+        self._status_var = tk.StringVar(value="PDFファイルを選択してください")
+        ttk.Label(self, textvariable=self._status_var, anchor="w",
+                  relief="sunken").grid(row=4, column=0, sticky="ew",
+                                        padx=12, pady=(0, 10))
+
+        # --- プログレスバー ---
+        self._progress = ttk.Progressbar(self, mode="indeterminate")
+        self._progress.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 10))
+
+    # ---- ファイル選択 ----
+
+    def _browse_pdf(self):
+        path = filedialog.askopenfilename(
+            title="PDFファイルを選択",
+            filetypes=[("PDF ファイル", "*.pdf"), ("すべてのファイル", "*.*")])
+        if not path:
+            return
+        self._pdf_var.set(path)
+        # 出力パスを自動補完（未入力のとき）
+        if not self._xlsx_var.get():
+            default_out = str(Path(path).with_suffix("")) + "_output.xlsx"
+            self._xlsx_var.set(default_out)
+        self._status_var.set("入力ファイル設定済み")
+
+    def _browse_xlsx(self):
+        init_dir  = str(Path(self._pdf_var.get()).parent) if self._pdf_var.get() else "."
+        init_file = Path(self._xlsx_var.get()).name if self._xlsx_var.get() else "output.xlsx"
+        path = filedialog.asksaveasfilename(
+            title="保存先を選択",
+            initialdir=init_dir,
+            initialfile=init_file,
+            defaultextension=".xlsx",
+            filetypes=[("Excel ファイル", "*.xlsx"), ("すべてのファイル", "*.*")])
+        if path:
+            self._xlsx_var.set(path)
+
+    # ---- 変換実行 ----
+
+    def _start(self):
+        pdf  = self._pdf_var.get().strip()
+        xlsx = self._xlsx_var.get().strip()
+
+        if not pdf:
+            self._status_var.set("[エラー] PDFファイルを選択してください")
+            return
+        if not xlsx:
+            self._status_var.set("[エラー] 出力ファイルを指定してください")
+            return
+
+        self._run_btn.config(state="disabled")
+        self._progress.start(12)
+        self._status_var.set("変換中…")
+        self._log_clear()
+
+        threading.Thread(target=self._worker, args=(pdf, xlsx), daemon=True).start()
+
+    def _worker(self, pdf: str, xlsx: str):
+        try:
+            run_conversion(pdf, xlsx, log=self._log)
+            self.after(0, self._on_success, xlsx)
+        except Exception as exc:
+            self.after(0, self._on_error, str(exc))
+
+    # ---- コールバック ----
+
+    def _on_success(self, xlsx: str):
+        self._progress.stop()
+        self._run_btn.config(state="normal")
+        self._status_var.set(f"[完了] {xlsx}")
+        self._log(f"\n[完了] 出力: {xlsx}")
+
+    def _on_error(self, msg: str):
+        self._progress.stop()
+        self._run_btn.config(state="normal")
+        self._status_var.set(f"[エラー] {msg}")
+        self._log(f"\n[エラー] {msg}")
+
+    # ---- ログユーティリティ ----
+
+    def _log(self, text: str):
+        """スレッドセーフなログ追記"""
+        def _append():
+            self._log_box.config(state="normal")
+            self._log_box.insert("end", text + "\n")
+            self._log_box.see("end")
+            self._log_box.config(state="disabled")
+        self.after(0, _append)
+
+    def _log_clear(self):
+        self._log_box.config(state="normal")
+        self._log_box.delete("1.0", "end")
+        self._log_box.config(state="disabled")
+
+
+# ---------------------------------------------------------------------------
+# エントリーポイント
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("使い方: python pdf_ocr_to_excel.py <PDFファイル> [出力Excelファイル]")
-        print("例:     python pdf_ocr_to_excel.py invoice-standard.pdf output.xlsx")
-        sys.exit(1)
+    # 引数あり → CLIモード
+    if len(sys.argv) >= 2:
+        pdf_path    = sys.argv[1]
+        output_path = sys.argv[2] if len(sys.argv) > 2 else Path(sys.argv[1]).stem + "_output.xlsx"
+        try:
+            run_conversion(pdf_path, output_path)
+        except Exception as exc:
+            print(f"[エラー] {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
 
-    pdf_path    = sys.argv[1]
-    output_path = sys.argv[2] if len(sys.argv) > 2 else Path(pdf_path).stem + "_output.xlsx"
-
-    if not Path(pdf_path).exists():
-        print(f"[エラー] ファイルが見つかりません: {pdf_path}")
-        sys.exit(1)
-
-    print(f"[1/3] PDF読み取り中: {pdf_path}")
-    data = extract_with_pdfplumber(pdf_path)
-
-    # テキストがほぼ取れなかった場合（スキャンPDF）はOCRにフォールバック
-    if len(data.get("raw_text", "").strip()) < 30:
-        print("      → テキスト抽出失敗。OCRにフォールバックします...")
-        data = extract_with_ocr(pdf_path)
-
-    print("[2/3] データ解析中...")
-    invoice = parse_invoice(data)
-
-    # 解析結果をコンソールに表示
-    print(f"      日付      : {invoice['date'] or '（未検出）'}")
-    print(f"      会社名    : {invoice['company_name'] or '（未検出）'}")
-    print(f"      請求金額  : {invoice['total_amount'] or '（未検出）'}")
-    print(f"      明細件数  : {len(invoice['items'])} 件")
-    for it in invoice["items"]:
-        print(f"        - {it['name']}  数量:{it['qty']}  単価:{it['unit_price']}  金額:{it['amount']}")
-
-    print("[3/3] Excel書き出し中...")
-    write_excel(invoice, output_path)
+    # 引数なし → GUIモード
+    app = App()
+    app.mainloop()
 
 
 if __name__ == "__main__":
